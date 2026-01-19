@@ -1,26 +1,117 @@
 @import "tailwindcss";
+@import "tw-animate-css";
+@plugin "@tailwindcss/typography";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
+@custom-variant dark (&:is(.dark *));
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+:root {
+  --radius: 0.5rem;
+
+  /* Premium Light Mode (Clean, airy, slightly cool) */
+  --background: oklch(0.98 0.01 240);
+  --foreground: oklch(0.12 0.02 240);
+
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.12 0.02 240);
+
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.12 0.02 240);
+
+  /* Violet-Indigo Primary */
+  --primary: oklch(0.45 0.24 280);
+  --primary-foreground: oklch(0.98 0 0);
+
+  --secondary: oklch(0.96 0.01 240);
+  --secondary-foreground: oklch(0.25 0.05 280);
+
+  --muted: oklch(0.96 0.01 240);
+  --muted-foreground: oklch(0.5 0.04 240);
+
+  --accent: oklch(0.96 0.01 240);
+  --accent-foreground: oklch(0.25 0.05 280);
+
+  --destructive: oklch(0.6 0.2 20);
+  --border: oklch(0.92 0.01 240);
+  --input: oklch(0.92 0.01 240);
+  --ring: oklch(0.45 0.24 280);
+}
+
+.dark {
+  /* Premium Dark Mode (Deep, rich, high contrast) */
+  --background: oklch(0.12 0.02 240);
+  /* #1a1b26 approx - Deep Blue/Black */
+  --foreground: oklch(0.92 0.01 240);
+
+  --card: oklch(0.15 0.02 240);
+  --card-foreground: oklch(0.92 0.01 240);
+
+  --popover: oklch(0.15 0.02 240);
+  --popover-foreground: oklch(0.92 0.01 240);
+
+  /* Vibrant Violet/Indigo for Pop */
+  --primary: oklch(0.65 0.25 280);
+  --primary-foreground: oklch(0.12 0.02 240);
+
+  --secondary: oklch(0.2 0.03 240);
+  --secondary-foreground: oklch(0.92 0.01 240);
+
+  --muted: oklch(0.2 0.03 240);
+  --muted-foreground: oklch(0.7 0.03 240);
+
+  --accent: oklch(0.2 0.03 240);
+  --accent-foreground: oklch(0.92 0.01 240);
+
+  --destructive: oklch(0.4 0.15 20);
+
+  --border: oklch(0.25 0.03 240);
+  --input: oklch(0.25 0.03 240);
+  --ring: oklch(0.65 0.25 280);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "ss01", "ss02", "cv01", "cv02";
   }
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+@layer utilities {
+  .glass {
+    @apply bg-background/60 backdrop-blur-lg border border-border/50;
+  }
+
+  .text-gradient {
+    @apply bg-clip-text text-transparent bg-gradient-to-r from-primary via-purple-400 to-pink-400;
+  }
 }
