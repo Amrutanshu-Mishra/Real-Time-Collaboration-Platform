@@ -19,7 +19,7 @@ export default function Home() {
                 <h1 className="text-4xl font-extrabold tracking-tight sm:text-5xl xl:text-7xl/none">
                   Collaborate in <span className="text-gradient">Real-Time</span> without limits.
                 </h1>
-                <p className="max-w-[600px] text-muted-foreground md:text-xl leading-relaxed">
+                <p className="max-w-150 text-muted-foreground md:text-xl leading-relaxed">
                   Experience the future of teamwork with our ultra-low latency platform. Edit, chat, and build together as if you were in the same room.
                 </p>
               </div>
@@ -43,7 +43,7 @@ export default function Home() {
               </div>
             </div>
             <div className="relative">
-              <div className="absolute -inset-4 bg-gradient-to-r from-primary to-purple-600 rounded-2xl blur-3xl opacity-20 animate-pulse"></div>
+              <div className="absolute -inset-4 bg-linear-to-r from-primary to-purple-600 rounded-2xl blur-3xl opacity-20 animate-pulse"></div>
               <div className="relative rounded-2xl border bg-background/50 backdrop-blur-sm p-2 shadow-2xl">
                 <div className="rounded-xl border bg-card p-4 aspect-video flex items-center justify-center text-muted-foreground">
                   {/* Placeholder for Hero Image/Dashboard Preview */}
@@ -60,7 +60,7 @@ export default function Home() {
         </div>
 
         {/* Background Elements */}
-        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[800px] h-[800px] bg-primary/5 rounded-full blur-3xl -z-10 pointer-events-none"></div>
+        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-200 h-200 bg-primary/5 rounded-full blur-3xl -z-10 pointer-events-none"></div>
       </section>
 
       {/* Features Section */}
