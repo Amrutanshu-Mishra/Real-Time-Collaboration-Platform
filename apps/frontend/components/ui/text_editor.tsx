@@ -1,17 +1,29 @@
 'use client'
 
+
+import Document from '@tiptap/extension-document'
+import Paragraph from '@tiptap/extension-paragraph'
+import Text from '@tiptap/extension-text'
 import { useEditor, EditorContent, Editor, useEditorState } from '@tiptap/react'
 import { Toggle } from "@/components/ui/toggle"
 import StarterKit from '@tiptap/starter-kit'
 import { BoldIcon, ItalicIcon, UnderlineIcon, Strikethrough, Heading1, Heading2, List, ListOrdered, Quote } from 'lucide-react'
 
+
+import Collaboration from '@tiptap/extension-collaboration'
+import * as Y from 'yjs'
+
+const doc = new Y.Doc() // Initialize Y.Doc for shared editing
+
+
 const Tiptap = () => {
      const editor = useEditor({
           extensions: [
-               StarterKit.configure({
-                    heading: {
-                         levels: [1, 2],
-                    },
+               Document,
+               Paragraph,
+               Text,
+               Collaboration.configure({
+                    document: doc, // Configure Y.Doc for collaboration
                }),
           ],
           content: `
