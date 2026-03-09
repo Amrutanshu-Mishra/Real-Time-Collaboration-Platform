@@ -1,17 +1,22 @@
+'use client'
+
+import { useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { Settings, Share2, Menu, Folder, Search, MoreHorizontal } from "lucide-react";
 import Tiptap from "../../components/ui/text_editor";
-
-// Placeholder Avatar component since we don't have one yet
-function UserAvatar({ fallback, src, className }: { fallback: string, src?: string, className?: string }) {
-     return (
-          <div className={`relative inline-flex items-center justify-center size-8 rounded-full overflow-hidden bg-muted ${className}`}>
-               <span className="font-medium text-xs text-muted-foreground">{fallback}</span>
-          </div>
-     )
-}
+import OnlineUsers from "@/components/ui/OnlineUsers";
+import { usePresence } from "@/hooks/usePresence";
 
 export default function EditorPage() {
+     const { currentUser, onlineUsers, handlePresenceMessage } = usePresence();
+
+     const onPresenceMessage = useCallback(
+          (data: string) => {
+               handlePresenceMessage(data);
+          },
+          [handlePresenceMessage]
+     );
+
      return (
           <div className="flex h-screen w-full bg-background overflow-hidden">
                {/* Sidebar */}
@@ -68,11 +73,11 @@ export default function EditorPage() {
                          </div>
 
                          <div className="flex items-center gap-3">
-                              <div className="flex -space-x-2">
-                                   <UserAvatar fallback="AM" className="ring-2 ring-background z-30" />
-                                   <UserAvatar fallback="JD" className="ring-2 ring-background z-20" />
-                                   <UserAvatar fallback="SJ" className="ring-2 ring-background z-10" />
-                              </div>
+                              {/* Live Online Users */}
+                              <OnlineUsers
+                                   users={onlineUsers}
+                                   currentUserId={currentUser?.userId ?? null}
+                              />
                               <div className="h-4 w-px bg-border mx-1" />
                               <Button variant="outline" size="sm" className="hidden sm:flex">
                                    <Share2 className="mr-2 size-3" />
@@ -87,7 +92,7 @@ export default function EditorPage() {
                     {/* Editor Area */}
                     <main className="flex-1 overflow-auto relative bg-muted/10">
                          <div className="absolute inset-0 bg-grid-black/[0.02] dark:bg-grid-white/[0.02] pointer-events-none" />
-                         <Tiptap />
+                         <Tiptap onPresenceMessage={onPresenceMessage} />
                     </main>
                </div>
           </div>
