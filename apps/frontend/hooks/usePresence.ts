@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useRef } from 'react'
 
 export interface UserInfo {
      userId: string
@@ -21,6 +21,9 @@ export function usePresence() {
      const [currentUser, setCurrentUser] = useState<UserInfo | null>(null)
      const [onlineUsers, setOnlineUsers] = useState<UserInfo[]>([])
 
+     // Keep a ref for the online users
+     const onlineUsersRef = useRef<UserInfo[]>([])
+
      /**
       * Call this with incoming WebSocket text messages (JSON).
       * Returns true if the message was a presence message, false otherwise.
@@ -35,7 +38,9 @@ export function usePresence() {
                }
 
                if (msg.type === 'presence-update') {
-                    setOnlineUsers(msg.users)
+                    const users: UserInfo[] = msg.users
+                    setOnlineUsers(users)
+                    onlineUsersRef.current = users
                     return true
                }
           } catch {
