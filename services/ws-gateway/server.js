@@ -1,5 +1,6 @@
 import WebSocket, { WebSocketServer } from "ws";
 import { URL } from "url";
+import * as Y from "yjs";
 
 const wss = new WebSocketServer({ port: 8080 });
 
@@ -14,12 +15,16 @@ function log(tag, message, meta = {}) {
 }
 
 // ── Room State ──────────────────────────────────────────────────────────
-// rooms: Map<docId, { clients: Map<WebSocket, UserInfo> }>
+// rooms: Map<docId, { doc: Y.Doc, clients: Map<WebSocket, UserInfo> }>
 //
-// The server groups every WebSocket connection into a "room" identified by
-// the docId the client sends during the handshake.  All Yjs CRDT updates
-// and presence broadcasts are scoped to the room — there is ZERO cross-
-// document traffic.
+// Each room holds:
+//   • doc      – server-side Y.Doc that is the source of truth for the document
+//   • clients  – all WebSocket connections currently in this room
+//
+// The server applies every incoming Yjs update to its own Y.Doc so it
+// always holds the latest CRDT state.  When a new client joins it receives
+// the full document state immediately, meaning clients no longer need to
+// rely on other peers being online.
 
 const rooms = new Map();
 
@@ -56,7 +61,8 @@ function pickColor() {
 /** Get or create a room for the given docId */
 function getOrCreateRoom(docId) {
   if (!rooms.has(docId)) {
-    rooms.set(docId, { clients: new Map() });
+    const doc = new Y.Doc();
+    rooms.set(docId, { doc, clients: new Map() });
     log("ROOM", `Created room`, { docId, totalRooms: rooms.size });
   }
   return rooms.get(docId);
@@ -95,16 +101,22 @@ function broadcastPresence(docId) {
   });
 }
 
-/** Remove a room if it has no clients left */
-function cleanupRoom(docId) {
+/**
+ * When the last client leaves, the room is NOT deleted.
+ * The Y.Doc stays in server memory so that a future client
+ * joining the same docId will receive the full document state.
+ */
+function onRoomEmpty(docId) {
   const room = rooms.get(docId);
   if (room && room.clients.size === 0) {
-    rooms.delete(docId);
-    log("ROOM", `Deleted empty room`, { docId, totalRooms: rooms.size });
+    log("ROOM", `Room is now empty but persisted in memory`, {
+      docId,
+      totalRooms: rooms.size,
+    });
   }
 }
 
-/** Print a snapshot of all active rooms (useful for periodic debugging) */
+/** Print a snapshot of all active rooms */
 function logRoomSnapshot() {
   if (rooms.size === 0) {
     log("SNAPSHOT", "No active rooms");
@@ -123,7 +135,6 @@ function logRoomSnapshot() {
 // ── Connection Handler ──────────────────────────────────────────────────
 wss.on("connection", (ws, req) => {
   // ── 1. Parse docId from query string ──────────────────────────────────
-  //    e.g. ws://localhost:8080?docId=my-doc
   const url = new URL(req.url, `http://${req.headers.host}`);
   const docId = url.searchParams.get("docId") || "default";
 
@@ -151,22 +162,61 @@ wss.on("connection", (ws, req) => {
     })
   );
 
-  // ── 5. Broadcast updated presence to everyone in this room ────────────
-  broadcastPresence(docId);
+  // ── 5. Send the full document state to the new client ─────────────────
+  //    This is the key persistence feature: the server holds the latest
+  //    CRDT state and sends it on join, so new clients are immediately
+  //    up-to-date even if no other peers are online.
+  const stateVector = Y.encodeStateAsUpdate(room.doc);
+  if (stateVector.length > 0) {
+    const syncMessage = new Uint8Array(stateVector.length + 1);
+    syncMessage[0] = 0; // type 0 = doc update
+    syncMessage.set(stateVector, 1);
+    ws.send(syncMessage);
+    log("SYNC", `Sent full doc state to new client`, {
+      docId,
+      bytes: stateVector.length,
+      to: userInfo.name,
+    });
+  }
 
-  // Log a full snapshot after a join so the terminal shows the big picture
+  // ── 6. Broadcast updated presence to everyone in this room ────────────
+  broadcastPresence(docId);
   logRoomSnapshot();
 
-  // ── 6. Handle incoming messages — route through the room ──────────────
+  // ── 7. Handle incoming messages — route through the room ──────────────
   ws.on("message", (message, isBinary) => {
     if (isBinary) {
-      // Binary → Yjs CRDT / awareness update → forward to all clients
-      // in the SAME room only (no cross-document traffic)
-      const byteLength = message.length || message.byteLength || 0;
-      let forwardedCount = 0;
+      const raw = Buffer.isBuffer(message) ? message : Buffer.from(message);
+      const byteLength = raw.length;
 
+      if (byteLength < 2) return; // need at least header + 1 byte payload
+
+      const messageType = raw[0];
+      const payload = raw.subarray(1);
+
+      if (messageType === 0) {
+        // ── Doc update ────────────────────────────────────────────────
+        // Apply to the server's Y.Doc so it always holds the latest state
+        try {
+          Y.applyUpdate(room.doc, payload);
+          log("DOC", `Applied update to server Y.Doc`, {
+            docId,
+            bytes: payload.length,
+            from: userInfo.name,
+          });
+        } catch (err) {
+          log("ERROR", `Failed to apply Yjs update`, {
+            docId,
+            from: userInfo.name,
+            error: err.message,
+          });
+        }
+      }
+
+      // Forward the original binary message to all OTHER clients in the room
+      let forwardedCount = 0;
       room.clients.forEach((_, client) => {
-        if (client.readyState === WebSocket.OPEN) {
+        if (client !== ws && client.readyState === WebSocket.OPEN) {
           client.send(message);
           forwardedCount++;
         }
@@ -174,12 +224,13 @@ wss.on("connection", (ws, req) => {
 
       log("ROUTE", `Binary update routed within room`, {
         docId,
+        type: messageType === 0 ? "doc" : "awareness",
         bytes: byteLength,
         from: userInfo.name,
         forwardedTo: forwardedCount,
       });
     } else {
-      // Text/JSON messages — handle if needed
+      // Text/JSON messages
       try {
         const msg = JSON.parse(message.toString());
         log("MSG", `JSON message received`, {
@@ -196,7 +247,7 @@ wss.on("connection", (ws, req) => {
     }
   });
 
-  // ── 7. Handle disconnect — remove from room and clean up ──────────────
+  // ── 8. Handle disconnect ──────────────────────────────────────────────
   ws.on("close", () => {
     room.clients.delete(ws);
     log("LEAVE", `${userInfo.name} left`, {
@@ -206,13 +257,11 @@ wss.on("connection", (ws, req) => {
     });
 
     broadcastPresence(docId);
-    cleanupRoom(docId);
-
-    // Show updated snapshot
+    onRoomEmpty(docId);
     logRoomSnapshot();
   });
 
-  // ── 8. Handle errors ──────────────────────────────────────────────────
+  // ── 9. Handle errors ──────────────────────────────────────────────────
   ws.on("error", (err) => {
     log("ERROR", `WebSocket error for ${userInfo.name}`, {
       docId,
