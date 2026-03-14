@@ -11,6 +11,7 @@ const wss = new WebSocketServer({ port: 8080 });
 const SNAPSHOT_DIR = process.env.SNAPSHOT_DIR || path.join(process.cwd(), "snapshots");
 const UPDATE_LOG_DIR = process.env.UPDATE_LOG_DIR || path.join(process.cwd(), "update-logs");
 const SNAPSHOT_UPDATE_INTERVAL = 50; // create snapshot every N doc updates
+const SNAPSHOT_MAX_AGE_MS = Number(process.env.SNAPSHOT_MAX_AGE_MS || 5 * 60 * 1000); // or every N minutes
 
 function sanitizeDocId(docId) {
   return docId.replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -99,11 +100,20 @@ function clearUpdateLog(docId) {
   }
 }
 
-/** After applying an update: increment count and snapshot every SNAPSHOT_UPDATE_INTERVAL. */
+/** After applying an update: increment count and snapshot by count or age. */
 function maybeSaveSnapshot(room, docId) {
+  const now = Date.now();
   room.updateCount = (room.updateCount || 0) + 1;
-  if (room.updateCount >= SNAPSHOT_UPDATE_INTERVAL) {
+  room.lastActivityAt = now;
+
+  const lastSnapshotAt = room.lastSnapshotAt || 0;
+  const shouldByCount = room.updateCount >= SNAPSHOT_UPDATE_INTERVAL;
+  const shouldByTime =
+    SNAPSHOT_MAX_AGE_MS > 0 && now - lastSnapshotAt >= SNAPSHOT_MAX_AGE_MS;
+
+  if (shouldByCount || shouldByTime) {
     room.updateCount = 0;
+    room.lastSnapshotAt = now;
     const state = Y.encodeStateAsUpdate(room.doc);
     saveSnapshot(docId, Buffer.from(state));
     clearUpdateLog(docId);
@@ -186,18 +196,45 @@ redisSubscriber.on("message", (channel, message) => {
 });
 
 // ── Room State ──────────────────────────────────────────────────────────
-// rooms: Map<docId, { doc: Y.Doc, clients: Map<WebSocket, UserInfo>, updateCount: number }>
+// rooms: Map<docId, { doc: Y.Doc, clients: Map<WebSocket, UserInfo>, updateCount: number, lastSnapshotAt: number, lastActivityAt: number }>
 //
 // Each room holds:
-//   • doc         – server-side Y.Doc that is the source of truth for the document
-//   • clients     – all WebSocket connections currently in this room
-//   • updateCount  – number of doc updates since last snapshot (triggers snapshot every 50)
+//   • doc           – server-side Y.Doc that is the source of truth for the document
+//   • clients       – all WebSocket connections currently in this room
+//   • updateCount   – number of doc updates since last snapshot (triggers snapshot every 50)
+//   • lastSnapshotAt – timestamp of last snapshot (ms since epoch)
+//   • lastActivityAt – timestamp of last doc update (ms since epoch)
 //
 // The server applies every incoming Yjs update to its own Y.Doc so it
 // always holds the latest CRDT state.  When a new client joins it receives
 // the full document state immediately. Snapshots are loaded when a room is created.
 
 const rooms = new Map();
+
+// ── Room garbage collection (optional memory cleanup) ───────────────────
+const ROOM_IDLE_TTL_MS = Number(process.env.ROOM_IDLE_TTL_MS || 10 * 60 * 1000); // remove if idle for N ms
+const ROOM_GC_INTERVAL_MS = Number(process.env.ROOM_GC_INTERVAL_MS || 60 * 1000); // scan interval
+
+function gcRooms() {
+  if (ROOM_IDLE_TTL_MS <= 0) return;
+  const now = Date.now();
+  let removed = 0;
+  for (const [docId, room] of rooms.entries()) {
+    const last = room.lastActivityAt || 0;
+    if (room.clients.size === 0 && now - last >= ROOM_IDLE_TTL_MS) {
+      rooms.delete(docId);
+      removed++;
+      log("GC", "Removed idle room from memory", { docId });
+    }
+  }
+  if (removed > 0) {
+    log("GC", "Rooms garbage collected", { removed, totalRooms: rooms.size });
+  }
+}
+
+if (ROOM_GC_INTERVAL_MS > 0) {
+  setInterval(gcRooms, ROOM_GC_INTERVAL_MS);
+}
 
 const AVATAR_COLORS = [
   "#6366f1", // indigo
@@ -265,7 +302,14 @@ function getOrCreateRoom(docId) {
       }
     }
 
-    rooms.set(docId, { doc, clients: new Map(), updateCount: 0 });
+    const now = Date.now();
+    rooms.set(docId, {
+      doc,
+      clients: new Map(),
+      updateCount: 0,
+      lastSnapshotAt: snapshotLoaded ? now : 0,
+      lastActivityAt: now,
+    });
     ensureSubscribedToDoc(docId);
     log("ROOM", snapshotLoaded ? "Created room, loaded snapshot" : "Created room", {
       docId,
