@@ -149,7 +149,7 @@ export default function Tiptap({ docId, onPresenceMessage, currentUser }: Tiptap
      // Keep the awareness user metadata in sync when currentUser changes after initial mount
      useEffect(() => {
           if (editor && currentUser) {
-               editor.commands.updateUser({ name: currentUser.name, color: currentUser.color })
+               (editor.commands as any).updateUser({ name: currentUser.name, color: currentUser.color })
           }
      }, [editor, currentUser])
 
