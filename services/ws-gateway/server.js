@@ -1,11 +1,11 @@
 import WebSocket, { WebSocketServer } from "ws";
 import { URL } from "url";
 import * as Y from "yjs";
+import Redis from "ioredis";
 
 const wss = new WebSocketServer({ port: 8080 });
 
 // ── Logging ─────────────────────────────────────────────────────────────
-
 function log(tag, message, meta = {}) {
   const timestamp = new Date().toISOString();
   const metaStr = Object.keys(meta).length
@@ -13,6 +13,70 @@ function log(tag, message, meta = {}) {
     : "";
   console.log(`[${timestamp}] [${tag}]  ${message}${metaStr}`);
 }
+
+// ── Redis (publisher + subscriber) ──────────────────────────────────────
+const REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
+const redisPublisher = new Redis(REDIS_URL);
+const redisSubscriber = new Redis(REDIS_URL);
+
+const DOC_CHANNEL_PREFIX = "doc:";
+function docChannel(docId) {
+  return `${DOC_CHANNEL_PREFIX}${docId}`;
+}
+
+/** Channels we're already subscribed to (avoid double-subscribe) */
+const subscribedChannels = new Set();
+
+function ensureSubscribedToDoc(docId) {
+  const ch = docChannel(docId);
+  if (subscribedChannels.has(ch)) return;
+  subscribedChannels.add(ch);
+  redisSubscriber.subscribe(ch, (err) => {
+    if (err)
+      log("REDIS", "Subscribe error", { channel: ch, error: err.message });
+    else log("REDIS", "Subscribed to channel", { channel: ch });
+  });
+}
+
+redisPublisher.on("error", (err) =>
+  log("REDIS", "Publisher error", { error: err.message })
+);
+redisSubscriber.on("error", (err) =>
+  log("REDIS", "Subscriber error", { error: err.message })
+);
+
+/**
+ * Handle messages from Redis: apply to server Y.Doc and broadcast to local clients only.
+ * Do NOT publish back to Redis — prevents infinite loops across servers.
+ */
+redisSubscriber.on("message", (channel, message) => {
+  if (!channel.startsWith(DOC_CHANNEL_PREFIX)) return;
+  const docId = channel.slice(DOC_CHANNEL_PREFIX.length);
+  const room = getOrCreateRoom(docId);
+  const payload = Buffer.isBuffer(message) ? message : Buffer.from(message);
+  try {
+    Y.applyUpdate(room.doc, payload);
+  } catch (err) {
+    log("REDIS", "Failed to apply Yjs update from Redis", {
+      docId,
+      error: err.message,
+    });
+    return;
+  }
+  const fullMessage = Buffer.concat([Buffer.from([0]), payload]);
+  let sentCount = 0;
+  room.clients.forEach((_, client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(fullMessage);
+      sentCount++;
+    }
+  });
+  log("REDIS", "Applied and broadcast to local clients only", {
+    docId,
+    bytes: payload.length,
+    sentTo: sentCount,
+  });
+});
 
 // ── Room State ──────────────────────────────────────────────────────────
 // rooms: Map<docId, { doc: Y.Doc, clients: Map<WebSocket, UserInfo> }>
@@ -58,11 +122,12 @@ function pickColor() {
 
 // ── Room helpers ────────────────────────────────────────────────────────
 
-/** Get or create a room for the given docId */
+/** Get or create a room for the given docId. Subscribes to Redis doc channel when room is created. */
 function getOrCreateRoom(docId) {
   if (!rooms.has(docId)) {
     const doc = new Y.Doc();
     rooms.set(docId, { doc, clients: new Map() });
+    ensureSubscribedToDoc(docId);
     log("ROOM", `Created room`, { docId, totalRooms: rooms.size });
   }
   return rooms.get(docId);
@@ -195,8 +260,7 @@ wss.on("connection", (ws, req) => {
       const payload = raw.subarray(1);
 
       if (messageType === 0) {
-        // ── Doc update ────────────────────────────────────────────────
-        // Apply to the server's Y.Doc so it always holds the latest state
+        // ── Doc update: apply -> broadcast locally -> publish to Redis ──
         try {
           Y.applyUpdate(room.doc, payload);
           log("DOC", `Applied update to server Y.Doc`, {
@@ -211,24 +275,43 @@ wss.on("connection", (ws, req) => {
             error: err.message,
           });
         }
+
+        // Forward to all OTHER local clients in the room
+        let forwardedCount = 0;
+        room.clients.forEach((_, client) => {
+          if (client !== ws && client.readyState === WebSocket.OPEN) {
+            client.send(message);
+            forwardedCount++;
+          }
+        });
+
+        // Publish to Redis so other server instances can sync (they will NOT re-publish)
+        redisPublisher.publish(docChannel(docId), payload).catch((err) => {
+          log("REDIS", "Publish error", { docId, error: err.message });
+        });
+
+        log("ROUTE", `Doc update: local broadcast + Redis publish`, {
+          docId,
+          bytes: byteLength,
+          from: userInfo.name,
+          forwardedTo: forwardedCount,
+        });
+      } else {
+        // ── Awareness (type 1): forward to local clients only, no Redis ──
+        let forwardedCount = 0;
+        room.clients.forEach((_, client) => {
+          if (client !== ws && client.readyState === WebSocket.OPEN) {
+            client.send(message);
+            forwardedCount++;
+          }
+        });
+        log("ROUTE", `Awareness update routed within room`, {
+          docId,
+          bytes: byteLength,
+          from: userInfo.name,
+          forwardedTo: forwardedCount,
+        });
       }
-
-      // Forward the original binary message to all OTHER clients in the room
-      let forwardedCount = 0;
-      room.clients.forEach((_, client) => {
-        if (client !== ws && client.readyState === WebSocket.OPEN) {
-          client.send(message);
-          forwardedCount++;
-        }
-      });
-
-      log("ROUTE", `Binary update routed within room`, {
-        docId,
-        type: messageType === 0 ? "doc" : "awareness",
-        bytes: byteLength,
-        from: userInfo.name,
-        forwardedTo: forwardedCount,
-      });
     } else {
       // Text/JSON messages
       try {
