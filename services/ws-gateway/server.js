@@ -7,8 +7,9 @@ import path from "path";
 
 const wss = new WebSocketServer({ port: 8080 });
 
-// ── Snapshot storage (file system) ──────────────────────────────────────
+// ── Snapshot & update-log storage (file system) ────────────────────────
 const SNAPSHOT_DIR = process.env.SNAPSHOT_DIR || path.join(process.cwd(), "snapshots");
+const UPDATE_LOG_DIR = process.env.UPDATE_LOG_DIR || path.join(process.cwd(), "update-logs");
 const SNAPSHOT_UPDATE_INTERVAL = 50; // create snapshot every N doc updates
 
 function sanitizeDocId(docId) {
@@ -17,6 +18,10 @@ function sanitizeDocId(docId) {
 
 function snapshotPath(docId) {
   return path.join(SNAPSHOT_DIR, `${sanitizeDocId(docId)}.snapshot`);
+}
+
+function updateLogPath(docId) {
+  return path.join(UPDATE_LOG_DIR, `${sanitizeDocId(docId)}.log`);
 }
 
 /** Load snapshot from disk (sync). Returns Buffer or null if not found. */
@@ -42,6 +47,58 @@ function saveSnapshot(docId, data) {
   });
 }
 
+/** Append a CRDT update to the per-document update log (base64 line). */
+function appendUpdateToLog(docId, updateUint8) {
+  try {
+    fs.mkdirSync(UPDATE_LOG_DIR, { recursive: true });
+    const filePath = updateLogPath(docId);
+    const line = Buffer.from(updateUint8).toString("base64") + "\n";
+    fs.appendFile(filePath, line, (err) => {
+      if (err) {
+        log("LOG", "Append error", { docId, error: err.message });
+      }
+    });
+  } catch (err) {
+    log("LOG", "Append exception", { docId, error: err.message });
+  }
+}
+
+/** Load all CRDT updates from the per-document update log. */
+function loadUpdateLog(docId) {
+  const filePath = updateLogPath(docId);
+  const updates = [];
+  try {
+    if (!fs.existsSync(filePath)) return updates;
+    const raw = fs.readFileSync(filePath, "utf8");
+    const lines = raw.split("\n");
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        updates.push(Buffer.from(trimmed, "base64"));
+      } catch (err) {
+        log("LOG", "Decode error, skipping line", { docId, error: err.message });
+      }
+    }
+  } catch (err) {
+    log("LOG", "Load error", { docId, error: err.message });
+  }
+  return updates;
+}
+
+/** Clear the per-document update log (used after snapshot). */
+function clearUpdateLog(docId) {
+  const filePath = updateLogPath(docId);
+  try {
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+      log("LOG", "Cleared log after snapshot", { docId });
+    }
+  } catch (err) {
+    log("LOG", "Clear error", { docId, error: err.message });
+  }
+}
+
 /** After applying an update: increment count and snapshot every SNAPSHOT_UPDATE_INTERVAL. */
 function maybeSaveSnapshot(room, docId) {
   room.updateCount = (room.updateCount || 0) + 1;
@@ -49,6 +106,7 @@ function maybeSaveSnapshot(room, docId) {
     room.updateCount = 0;
     const state = Y.encodeStateAsUpdate(room.doc);
     saveSnapshot(docId, Buffer.from(state));
+    clearUpdateLog(docId);
   }
 }
 
@@ -110,6 +168,7 @@ redisSubscriber.on("message", (channel, message) => {
     });
     return;
   }
+  appendUpdateToLog(docId, payload);
   maybeSaveSnapshot(room, docId);
   const fullMessage = Buffer.concat([Buffer.from([0]), payload]);
   let sentCount = 0;
@@ -170,7 +229,7 @@ function pickColor() {
 
 // ── Room helpers ────────────────────────────────────────────────────────
 
-/** Get or create a room for the given docId. Loads snapshot if present; subscribes to Redis when room is created. */
+/** Get or create a room for the given docId. Loads snapshot if present, then replays update log; subscribes to Redis when room is created. */
 function getOrCreateRoom(docId) {
   if (!rooms.has(docId)) {
     const doc = new Y.Doc();
@@ -186,6 +245,26 @@ function getOrCreateRoom(docId) {
         log("ROOM", "Failed to apply snapshot, starting empty", { docId, error: err.message });
       }
     }
+
+    // After snapshot, replay any incremental updates in the log
+    const logUpdates = loadUpdateLog(docId);
+    if (logUpdates.length > 0) {
+      try {
+        for (const update of logUpdates) {
+          Y.applyUpdate(doc, update);
+        }
+        log("ROOM", "Applied updates from log", {
+          docId,
+          updates: logUpdates.length,
+        });
+      } catch (err) {
+        log("ROOM", "Failed to apply update log, continuing with snapshot state", {
+          docId,
+          error: err.message,
+        });
+      }
+    }
+
     rooms.set(docId, { doc, clients: new Map(), updateCount: 0 });
     ensureSubscribedToDoc(docId);
     log("ROOM", snapshotLoaded ? "Created room, loaded snapshot" : "Created room", {
@@ -327,6 +406,7 @@ wss.on("connection", (ws, req) => {
         // ── Doc update: apply -> broadcast locally -> publish to Redis ──
         try {
           Y.applyUpdate(room.doc, payload);
+          appendUpdateToLog(docId, payload);
           maybeSaveSnapshot(room, docId);
           log("DOC", `Applied update to server Y.Doc`, {
             docId,
