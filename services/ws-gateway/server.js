@@ -2,8 +2,55 @@ import WebSocket, { WebSocketServer } from "ws";
 import { URL } from "url";
 import * as Y from "yjs";
 import Redis from "ioredis";
+import fs from "fs";
+import path from "path";
 
 const wss = new WebSocketServer({ port: 8080 });
+
+// ── Snapshot storage (file system) ──────────────────────────────────────
+const SNAPSHOT_DIR = process.env.SNAPSHOT_DIR || path.join(process.cwd(), "snapshots");
+const SNAPSHOT_UPDATE_INTERVAL = 50; // create snapshot every N doc updates
+
+function sanitizeDocId(docId) {
+  return docId.replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
+function snapshotPath(docId) {
+  return path.join(SNAPSHOT_DIR, `${sanitizeDocId(docId)}.snapshot`);
+}
+
+/** Load snapshot from disk (sync). Returns Buffer or null if not found. */
+function loadSnapshot(docId) {
+  const filePath = snapshotPath(docId);
+  try {
+    if (fs.existsSync(filePath)) {
+      return fs.readFileSync(filePath);
+    }
+  } catch (err) {
+    log("SNAPSHOT", "Load error", { docId, error: err.message });
+  }
+  return null;
+}
+
+/** Save snapshot to disk (async, fire-and-forget). */
+function saveSnapshot(docId, data) {
+  const filePath = snapshotPath(docId);
+  fs.mkdirSync(SNAPSHOT_DIR, { recursive: true });
+  fs.writeFile(filePath, data, (err) => {
+    if (err) log("SNAPSHOT", "Save error", { docId, error: err.message });
+    else log("SNAPSHOT", "Saved", { docId, bytes: data.length });
+  });
+}
+
+/** After applying an update: increment count and snapshot every SNAPSHOT_UPDATE_INTERVAL. */
+function maybeSaveSnapshot(room, docId) {
+  room.updateCount = (room.updateCount || 0) + 1;
+  if (room.updateCount >= SNAPSHOT_UPDATE_INTERVAL) {
+    room.updateCount = 0;
+    const state = Y.encodeStateAsUpdate(room.doc);
+    saveSnapshot(docId, Buffer.from(state));
+  }
+}
 
 // ── Logging ─────────────────────────────────────────────────────────────
 function log(tag, message, meta = {}) {
@@ -63,6 +110,7 @@ redisSubscriber.on("message", (channel, message) => {
     });
     return;
   }
+  maybeSaveSnapshot(room, docId);
   const fullMessage = Buffer.concat([Buffer.from([0]), payload]);
   let sentCount = 0;
   room.clients.forEach((_, client) => {
@@ -79,16 +127,16 @@ redisSubscriber.on("message", (channel, message) => {
 });
 
 // ── Room State ──────────────────────────────────────────────────────────
-// rooms: Map<docId, { doc: Y.Doc, clients: Map<WebSocket, UserInfo> }>
+// rooms: Map<docId, { doc: Y.Doc, clients: Map<WebSocket, UserInfo>, updateCount: number }>
 //
 // Each room holds:
-//   • doc      – server-side Y.Doc that is the source of truth for the document
-//   • clients  – all WebSocket connections currently in this room
+//   • doc         – server-side Y.Doc that is the source of truth for the document
+//   • clients     – all WebSocket connections currently in this room
+//   • updateCount  – number of doc updates since last snapshot (triggers snapshot every 50)
 //
 // The server applies every incoming Yjs update to its own Y.Doc so it
 // always holds the latest CRDT state.  When a new client joins it receives
-// the full document state immediately, meaning clients no longer need to
-// rely on other peers being online.
+// the full document state immediately. Snapshots are loaded when a room is created.
 
 const rooms = new Map();
 
@@ -122,13 +170,29 @@ function pickColor() {
 
 // ── Room helpers ────────────────────────────────────────────────────────
 
-/** Get or create a room for the given docId. Subscribes to Redis doc channel when room is created. */
+/** Get or create a room for the given docId. Loads snapshot if present; subscribes to Redis when room is created. */
 function getOrCreateRoom(docId) {
   if (!rooms.has(docId)) {
     const doc = new Y.Doc();
-    rooms.set(docId, { doc, clients: new Map() });
+    let snapshotLoaded = false;
+    let snapshotBytes = 0;
+    const snapshotData = loadSnapshot(docId);
+    if (snapshotData && snapshotData.length > 0) {
+      try {
+        Y.applyUpdate(doc, snapshotData);
+        snapshotLoaded = true;
+        snapshotBytes = snapshotData.length;
+      } catch (err) {
+        log("ROOM", "Failed to apply snapshot, starting empty", { docId, error: err.message });
+      }
+    }
+    rooms.set(docId, { doc, clients: new Map(), updateCount: 0 });
     ensureSubscribedToDoc(docId);
-    log("ROOM", `Created room`, { docId, totalRooms: rooms.size });
+    log("ROOM", snapshotLoaded ? "Created room, loaded snapshot" : "Created room", {
+      docId,
+      ...(snapshotLoaded && { bytes: snapshotBytes }),
+      totalRooms: rooms.size,
+    });
   }
   return rooms.get(docId);
 }
@@ -263,6 +327,7 @@ wss.on("connection", (ws, req) => {
         // ── Doc update: apply -> broadcast locally -> publish to Redis ──
         try {
           Y.applyUpdate(room.doc, payload);
+          maybeSaveSnapshot(room, docId);
           log("DOC", `Applied update to server Y.Doc`, {
             docId,
             bytes: payload.length,
