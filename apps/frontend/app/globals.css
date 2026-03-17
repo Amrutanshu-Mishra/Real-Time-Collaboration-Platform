@@ -208,6 +208,8 @@
   border-left: 2px solid #0d0d0d;
   word-break: normal;
   pointer-events: none;
+  /* Smooth glide between positions instead of instant jumps */
+  transition: transform 80ms ease-out, opacity 80ms ease-out;
   animation: cursor-blink 1.2s ease-in-out infinite;
 }
 
@@ -232,6 +234,8 @@
   pointer-events: none;
   z-index: 40;
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
+  /* Smooth fade-in on appear, gentle opacity transition */
+  transition: opacity 150ms ease;
   animation: cursor-label-in 0.2s ease-out;
 }
 

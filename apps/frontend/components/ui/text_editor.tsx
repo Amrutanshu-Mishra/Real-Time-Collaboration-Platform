@@ -88,17 +88,36 @@ export default function Tiptap({ docId, onPresenceMessage, currentUser }: Tiptap
                }
           }
 
-          const handleAwarenessUpdate = ({ added, updated, removed }: any, origin: any) => {
-               // Don't bounce messages back right after receiving them from the server
-               if (origin === socket) return
+          const AWARENESS_THROTTLE_MS = 50
 
-               if (socket.readyState === WebSocket.OPEN) {
-                    const changedClients = added.concat(updated).concat(removed)
-                    const update = encodeAwarenessUpdate(awareness, changedClients)
+          // ── Throttled awareness sender ────────────────────────────
+          // Buffers cursor/presence changes and sends at most once per
+          // AWARENESS_THROTTLE_MS. Trailing-edge: the last position in
+          // each window is always sent.
+          let awarenessTimer: ReturnType<typeof setTimeout> | null = null
+          let pendingAwarenessUpdate: Uint8Array | null = null
+
+          const flushAwareness = () => {
+               if (pendingAwarenessUpdate && socket.readyState === WebSocket.OPEN) {
+                    const update = pendingAwarenessUpdate
                     const message = new Uint8Array(update.length + 1)
                     message[0] = 1 // type 1 = awareness update
                     message.set(update, 1)
                     socket.send(message)
+               }
+               pendingAwarenessUpdate = null
+               awarenessTimer = null
+          }
+
+          const handleAwarenessUpdate = ({ added, updated, removed }: any, origin: any) => {
+               // Don't bounce messages back right after receiving them from the server
+               if (origin === socket) return
+
+               const changedClients = added.concat(updated).concat(removed)
+               pendingAwarenessUpdate = encodeAwarenessUpdate(awareness, changedClients)
+
+               if (!awarenessTimer) {
+                    awarenessTimer = setTimeout(flushAwareness, AWARENESS_THROTTLE_MS)
                }
           }
 
@@ -108,6 +127,8 @@ export default function Tiptap({ docId, onPresenceMessage, currentUser }: Tiptap
           return () => {
                doc.off("update", handleDocUpdate)
                awareness.off("update", handleAwarenessUpdate)
+               if (awarenessTimer) clearTimeout(awarenessTimer)
+               flushAwareness() // send any remaining buffered update
                awareness.setLocalState(null) // remove self from awareness on disconnect
                socket.close()
           }

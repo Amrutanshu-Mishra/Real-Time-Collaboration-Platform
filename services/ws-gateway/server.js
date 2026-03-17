@@ -25,6 +25,13 @@ const REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
 const redisPublisher = new Redis(REDIS_URL);
 const redisSubscriber = new Redis(REDIS_URL);
 
+// Unique ID for this server instance — used to skip self-echo on Redis.
+const SERVER_ID = `srv-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+
+// ── Message type constants ──────────────────────────────────────────────
+const MSG_TYPE_DOC = 0;       // CRDT document update
+const MSG_TYPE_AWARENESS = 1; // Cursor / presence awareness update
+
 const DOC_CHANNEL_PREFIX = "doc:";
 function docChannel(docId) {
   return `${DOC_CHANNEL_PREFIX}${docId}`;
@@ -58,16 +65,25 @@ redisSubscriber.on("error", (err) =>
 // This handler receives updates published to Redis by OTHER server
 // instances. It applies them to the local Y.Doc, broadcasts to local
 // clients, and feeds into the Snapshot System (last pipeline stage).
-redisSubscriber.on("message", (channel, message) => {
+redisSubscriber.on("messageBuffer", (channelBuf, messageBuf) => {
+  const channel = channelBuf.toString();
   if (!channel.startsWith(DOC_CHANNEL_PREFIX)) return;
   const docId = channel.slice(DOC_CHANNEL_PREFIX.length);
 
+  // ── Skip self-echo ────────────────────────────────────────────────────
+  // We tag every publish with our SERVER_ID. If we receive our own
+  // message back we skip it — the local Y.Doc already has the update.
+  const raw = Buffer.isBuffer(messageBuf) ? messageBuf : Buffer.from(messageBuf);
+
+  // Envelope: [serverId_length (1 byte)] [serverId bytes] [yjs payload]
+  const idLen = raw[0];
+  const originId = raw.slice(1, 1 + idLen).toString();
+  if (originId === SERVER_ID) return; // skip self-echo
+
+  const payload = raw.slice(1 + idLen);
+
   // ── Load-then-apply guarantee ─────────────────────────────────────────
-  // getOrCreateRoom uses single-flight dedup: if this docId is not yet in
-  // memory it loads the snapshot first (exactly once), then we apply the
-  // Redis update on top — so no update is ever lost.
   getOrCreateRoom(docId, ensureSubscribedToDoc).then((room) => {
-    const payload = Buffer.isBuffer(message) ? message : Buffer.from(message);
     try {
       Y.applyUpdate(room.doc, payload);
     } catch (err) {
@@ -81,15 +97,15 @@ redisSubscriber.on("message", (channel, message) => {
     // In-memory update log
     room.updateLog.push(new Uint8Array(payload));
 
-    // Broadcast to local clients
-    const fullMessage = Buffer.concat([Buffer.from([0]), payload]);
+    // Broadcast to local clients (optimised loop)
+    const fullMessage = Buffer.concat([Buffer.from([MSG_TYPE_DOC]), payload]);
     let sentCount = 0;
-    room.clients.forEach((_, client) => {
+    for (const [client] of room.clients) {
       if (client.readyState === WebSocket.OPEN) {
         client.send(fullMessage);
         sentCount++;
       }
-    });
+    }
 
     // ── Snapshot System (pipeline stage 5) ──
     trackUpdate(room, docId);
@@ -178,8 +194,25 @@ function getPresenceList(docId) {
   return Array.from(room.clients.values());
 }
 
-/** Broadcast a JSON presence update to all clients in a room */
+/** Broadcast a JSON presence update to all clients in a room (debounced) */
+const PRESENCE_DEBOUNCE_MS = 100;
+const presenceTimers = new Map(); // Map<docId, timer>
+
 function broadcastPresence(docId) {
+  // Debounce: collapse a burst of join/leave events into one broadcast
+  if (presenceTimers.has(docId)) {
+    clearTimeout(presenceTimers.get(docId));
+  }
+  presenceTimers.set(
+    docId,
+    setTimeout(() => {
+      presenceTimers.delete(docId);
+      _doBroadcastPresence(docId);
+    }, PRESENCE_DEBOUNCE_MS)
+  );
+}
+
+function _doBroadcastPresence(docId) {
   const room = rooms.get(docId);
   if (!room) return;
 
@@ -187,12 +220,12 @@ function broadcastPresence(docId) {
   const payload = JSON.stringify({ type: "presence-update", users });
 
   let sentCount = 0;
-  room.clients.forEach((_, client) => {
+  for (const [client] of room.clients) {
     if (client.readyState === WebSocket.OPEN) {
       client.send(payload);
       sentCount++;
     }
-  });
+  }
 
   log("PRESENCE", `Broadcast to room`, {
     docId,
@@ -294,63 +327,81 @@ async function startServer() {
         const messageType = raw[0];
         const payload = raw.subarray(1);
 
-        if (messageType === 0) {
-          // ── Stage 2: Apply to server Y.Doc ──
-          try {
-            Y.applyUpdate(room.doc, payload);
-            room.updateLog.push(new Uint8Array(payload));
-            log("DOC", `Applied update to server Y.Doc`, {
-              docId,
-              bytes: payload.length,
-              from: userInfo.name,
+        switch (messageType) {
+          case MSG_TYPE_DOC: {
+            // ── Stage 2: Apply CRDT update to server Y.Doc ──
+            try {
+              Y.applyUpdate(room.doc, payload);
+              room.updateLog.push(new Uint8Array(payload));
+              log("DOC", `Applied CRDT update to server Y.Doc`, {
+                docId,
+                bytes: payload.length,
+                from: userInfo.name,
+              });
+            } catch (err) {
+              log("ERROR", `Failed to apply Yjs CRDT update`, {
+                docId,
+                from: userInfo.name,
+                error: err.message,
+              });
+              return;
+            }
+
+            // Broadcast to local clients (optimised for..of)
+            let docForwardCount = 0;
+            for (const [client] of room.clients) {
+              if (client !== ws && client.readyState === WebSocket.OPEN) {
+                client.send(message);
+                docForwardCount++;
+              }
+            }
+
+            // ── Stage 3: Publish to Redis Pub/Sub (tagged with SERVER_ID) ──
+            const idBuf = Buffer.from(SERVER_ID);
+            const envelope = Buffer.concat([
+              Buffer.from([idBuf.length]),
+              idBuf,
+              payload,
+            ]);
+            redisPublisher.publish(docChannel(docId), envelope).catch((err) => {
+              log("REDIS", "Publish error", { docId, error: err.message });
             });
-          } catch (err) {
-            log("ERROR", `Failed to apply Yjs update`, {
+
+            // ── Stage 4 & 5: Snapshot System → MongoDB ──
+            trackUpdate(room, docId);
+
+            log("ROUTE", `Pipeline complete: Y.Doc → Redis → Snapshot`, {
               docId,
+              bytes: raw.length,
               from: userInfo.name,
-              error: err.message,
+              forwardedTo: docForwardCount,
             });
-            return;
+            break;
           }
 
-          // Broadcast to local clients
-          let forwardedCount = 0;
-          room.clients.forEach((_, client) => {
-            if (client !== ws && client.readyState === WebSocket.OPEN) {
-              client.send(message);
-              forwardedCount++;
+          case MSG_TYPE_AWARENESS: {
+            // Awareness: forward to local clients only — no CRDT pipeline
+            let awarenessForwardCount = 0;
+            for (const [client] of room.clients) {
+              if (client !== ws && client.readyState === WebSocket.OPEN) {
+                client.send(message);
+                awarenessForwardCount++;
+              }
             }
-          });
+            log("AWARENESS", `Cursor/presence update routed within room`, {
+              docId,
+              bytes: raw.length,
+              from: userInfo.name,
+              forwardedTo: awarenessForwardCount,
+            });
+            break;
+          }
 
-          // ── Stage 3: Publish to Redis Pub/Sub ──
-          redisPublisher.publish(docChannel(docId), payload).catch((err) => {
-            log("REDIS", "Publish error", { docId, error: err.message });
-          });
-
-          // ── Stage 4 & 5: Snapshot System → MongoDB ──
-          trackUpdate(room, docId);
-
-          log("ROUTE", `Pipeline complete: Y.Doc → Redis → Snapshot`, {
-            docId,
-            bytes: raw.length,
-            from: userInfo.name,
-            forwardedTo: forwardedCount,
-          });
-        } else {
-          // Awareness (type 1): forward to local clients only
-          let forwardedCount = 0;
-          room.clients.forEach((_, client) => {
-            if (client !== ws && client.readyState === WebSocket.OPEN) {
-              client.send(message);
-              forwardedCount++;
-            }
-          });
-          log("ROUTE", `Awareness update routed within room`, {
-            docId,
-            bytes: raw.length,
-            from: userInfo.name,
-            forwardedTo: forwardedCount,
-          });
+          default:
+            log("WARN", `Unknown binary message type ${messageType}`, {
+              docId,
+              from: userInfo.name,
+            });
         }
       } else {
         try {
