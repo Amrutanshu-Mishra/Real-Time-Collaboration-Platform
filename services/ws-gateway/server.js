@@ -4,8 +4,12 @@ import * as Y from "yjs";
 import Redis from "ioredis";
 
 import { connectDB } from "./db/connection.js";
-import { loadSnapshot } from "./db/snapshotStore.js";
 import { trackUpdate, forceSnapshot } from "./snapshotSystem.js";
+import {
+  rooms,
+  getOrCreateRoom,
+  evictRoom,
+} from "./documentManager.js";
 
 // ── Logging ─────────────────────────────────────────────────────────────
 function log(tag, message, meta = {}) {
@@ -58,7 +62,11 @@ redisSubscriber.on("message", (channel, message) => {
   if (!channel.startsWith(DOC_CHANNEL_PREFIX)) return;
   const docId = channel.slice(DOC_CHANNEL_PREFIX.length);
 
-  getOrCreateRoom(docId).then((room) => {
+  // ── Load-then-apply guarantee ─────────────────────────────────────────
+  // getOrCreateRoom uses single-flight dedup: if this docId is not yet in
+  // memory it loads the snapshot first (exactly once), then we apply the
+  // Redis update on top — so no update is ever lost.
+  getOrCreateRoom(docId, ensureSubscribedToDoc).then((room) => {
     const payload = Buffer.isBuffer(message) ? message : Buffer.from(message);
     try {
       Y.applyUpdate(room.doc, payload);
@@ -91,10 +99,15 @@ redisSubscriber.on("message", (channel, message) => {
       bytes: payload.length,
       sentTo: sentCount,
     });
+  }).catch((err) => {
+    log("REDIS", "Failed to load room before applying update", {
+      docId,
+      error: err.message,
+    });
   });
 });
 
-// ── Room State ──────────────────────────────────────────────────────────
+// ── Room State (managed by documentManager.js) ──────────────────────────
 //
 // rooms: Map<docId, {
 //   doc: Y.Doc,
@@ -104,7 +117,7 @@ redisSubscriber.on("message", (channel, message) => {
 //   lastActivityAt: number,
 //   updateLog: Uint8Array[]
 // }>
-const rooms = new Map();
+// Imported from documentManager — do NOT declare a local `rooms` here.
 
 // ── Room garbage collection ─────────────────────────────────────────────
 const ROOM_IDLE_TTL_MS = Number(process.env.ROOM_IDLE_TTL_MS || 10 * 60 * 1000);
@@ -117,10 +130,9 @@ function gcRooms() {
   for (const [docId, room] of rooms.entries()) {
     const last = room.lastActivityAt || 0;
     if (room.clients.size === 0 && now - last >= ROOM_IDLE_TTL_MS) {
-      forceSnapshot(room, docId);
-      rooms.delete(docId);
+      // evictRoom handles snapshot + removal from both maps
+      evictRoom(docId);
       removed++;
-      log("GC", "Snapshot saved & idle room removed from memory", { docId });
     }
   }
   if (removed > 0) {
@@ -154,54 +166,10 @@ function pickColor() {
 }
 
 // ── Room helpers ────────────────────────────────────────────────────────
-
-/**
- * Get or create a room for the given docId.
- * On first access: loads snapshot from MongoDB → subscribes to Redis.
- */
-async function getOrCreateRoom(docId) {
-  if (!rooms.has(docId)) {
-    const doc = new Y.Doc();
-    let snapshotLoaded = false;
-    let snapshotBytes = 0;
-
-    // Load persisted snapshot from MongoDB
-    const snapshotData = await loadSnapshot(docId);
-    if (snapshotData && snapshotData.length > 0) {
-      try {
-        Y.applyUpdate(doc, snapshotData);
-        snapshotLoaded = true;
-        snapshotBytes = snapshotData.length;
-      } catch (err) {
-        log("ROOM", "Failed to apply snapshot, starting empty", {
-          docId,
-          error: err.message,
-        });
-      }
-    }
-
-    const now = Date.now();
-    rooms.set(docId, {
-      doc,
-      clients: new Map(),
-      updateCount: 0,
-      lastSnapshotAt: snapshotLoaded ? now : 0,
-      lastActivityAt: now,
-      updateLog: [], // in-memory update log
-    });
-    ensureSubscribedToDoc(docId);
-    log(
-      "ROOM",
-      snapshotLoaded ? "Created room, loaded snapshot from DB" : "Created room",
-      {
-        docId,
-        ...(snapshotLoaded && { bytes: snapshotBytes }),
-        totalRooms: rooms.size,
-      }
-    );
-  }
-  return rooms.get(docId);
-}
+//
+// getOrCreateRoom, rooms, and evictRoom are provided by documentManager.js.
+// This server passes `ensureSubscribedToDoc` as the onFirstLoad callback so
+// each new room is automatically wired up to its Redis channel exactly once.
 
 /** Build the presence list for a specific room */
 function getPresenceList(docId) {
@@ -236,6 +204,7 @@ function broadcastPresence(docId) {
 /**
  * When the last client leaves, force-save a snapshot via the Snapshot System
  * so the latest state is always persisted in MongoDB.
+ * The room is kept in memory (GC will evict it if it stays idle).
  */
 function onRoomEmpty(docId) {
   const room = rooms.get(docId);
@@ -287,8 +256,8 @@ async function startServer() {
       color: pickColor(),
     };
 
-    // Load room (loads snapshot from MongoDB on first access)
-    const room = await getOrCreateRoom(docId);
+    // Load room (lazy-loaded with single-flight dedup via documentManager)
+    const room = await getOrCreateRoom(docId, ensureSubscribedToDoc);
     room.clients.set(ws, userInfo);
     log("JOIN", `${userInfo.name} joined`, {
       docId,
