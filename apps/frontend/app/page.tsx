@@ -1,9 +1,24 @@
+"use client";
+
+import { useState } from "react";
+import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { ArrowRight, Globe, Lock, Zap } from "lucide-react";
 import Image from "next/image";
 
 export default function Home() {
+  const [docName, setDocName] = useState("");
+  const router = useRouter();
+
+  const handleJoin = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (docName.trim()) {
+      router.push(`/editor/${encodeURIComponent(docName.trim())}`);
+    }
+  };
+
   return (
     <div className="flex flex-col min-h-[calc(100vh-4rem)]">
       {/* Hero Section */}
@@ -19,18 +34,25 @@ export default function Home() {
                 <h1 className="text-4xl font-extrabold tracking-tight sm:text-5xl xl:text-7xl/none">
                   Collaborate in <span className="text-gradient">Real-Time</span> without limits.
                 </h1>
-                <p className="max-w-150 text-muted-foreground md:text-xl leading-relaxed">
+                <p className="max-w-[600px] text-muted-foreground md:text-xl leading-relaxed">
                   Experience the future of teamwork with our ultra-low latency platform. Edit, chat, and build together as if you were in the same room.
                 </p>
               </div>
-              <div className="flex flex-col gap-3 min-[400px]:flex-row">
-                <Button size="lg" variant="premium" className="h-12 px-8 text-base">
-                  Start Collaborating <ArrowRight className="ml-2 size-4" />
+              
+              <form onSubmit={handleJoin} className="flex flex-col gap-3 min-[400px]:flex-row max-w-md">
+                <Input
+                  type="text"
+                  placeholder="Enter a document name..."
+                  value={docName}
+                  onChange={(e) => setDocName(e.target.value)}
+                  className="h-12 text-base px-4 bg-background/50 backdrop-blur-sm"
+                  required
+                />
+                <Button type="submit" size="lg" variant="premium" className="h-12 px-8 text-base shrink-0">
+                  Join / Create <ArrowRight className="ml-2 size-4" />
                 </Button>
-                <Button size="lg" variant="outline" className="h-12 px-8 text-base">
-                  View Demo
-                </Button>
-              </div>
+              </form>
+              
               <div className="flex items-center gap-4 text-sm text-muted-foreground">
                 <div className="flex -space-x-2">
                   {[1, 2, 3, 4].map((i) => (
@@ -42,7 +64,7 @@ export default function Home() {
                 <p>Trusted by 1,000+ teams</p>
               </div>
             </div>
-            <div className="relative">
+            <div className="relative hidden lg:block">
               <div className="absolute -inset-4 bg-linear-to-r from-primary to-purple-600 rounded-2xl blur-3xl opacity-20 animate-pulse"></div>
               <div className="relative rounded-2xl border bg-background/50 backdrop-blur-sm p-2 shadow-2xl">
                 <div className="rounded-xl border bg-card p-4 aspect-video flex items-center justify-center text-muted-foreground">
